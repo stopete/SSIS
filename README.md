@@ -1,6 +1,6 @@
-🖥️ SSIS Simple Seat Imaging
+🖥️ SSIS Simple Seat Imaging System
 
-🚀 SSIS Simple Seat Imaging is a PowerShell-based Windows deployment and imaging platform designed for rapid workstation provisioning, disk imaging, and recovery operations.
+🚀 SSIS Simple Seat Imaging System is a PowerShell-based Windows deployment and imaging platform designed for rapid workstation provisioning, disk imaging, and recovery operations.
 
 It is commonly used in WinPE environments to automate system deployment.
 
@@ -20,7 +20,7 @@ Hostname provisioning
 
 🧰 Preparing Windows PE to Launch SSIS Automatically
 
-Before using SSIS Simple Seat Imaging, you can configure Windows PE (WinPE) so that the SSIS provisioning application launches automatically when the system boots.
+Before using SSIS Simple Seat Imaging System, you can configure Windows PE (WinPE) so that the SSIS provisioning application launches automatically when the system boots.
 
 This is useful for automated workstation deployment environments.
 
