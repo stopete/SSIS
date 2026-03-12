@@ -1,0 +1,320 @@
+﻿<File version="3.2">
+  <Code><![CDATA[#requires -Version 5.1
+<#
+.SYNOPSIS
+    Startup script for a SAPIEN PowerShell Studio packaged WinForms app that uses a media labeled 'Provision'.
+
+.DESCRIPTION
+    - Detects a drive by volume label (default: 'Provision').
+    - Verifies a required subfolder at the root (default: 'ssis').
+    - Initializes default application paths (preserves original $default_* variables).
+    - Optionally logs to file under \logs\ and auto-creates missing folders.
+    - Launches the generated main form (Show-MainForm_psf) if available.
+    - Sets $script:ExitCode for the Packager runtime.
+
+.PARAMETER Commandline
+    Argument string passed by the Packager to Main().
+
+.PARAMETER VolumeLabel
+    The expected drive volume label. Default: 'Provision'.
+
+.PARAMETER RequiredRootFolder
+    The expected top-level folder under the drive root. Default: 'ssis'.
+
+.PARAMETER SsisCoreFolder
+    Optional sibling root for core apps (e.g., 'ssiscore'). If present, CoreAppsPath = <drive>:\ssiscore\apps\
+
+.PARAMETER Strict
+    When set, missing prerequisites cause a terminating error (throw). Otherwise script warns and returns.
+
+.PARAMETER AutoCreate
+    When set, missing subfolders (e.g., images, scripts) are created automatically.
+
+.PARAMETER EnableTranscript
+    When set, writes a transcript log to <drive>:\ssis\logs\Start-YYYYMMDD_HHMMSS.log
+#>
+
+[CmdletBinding()]
+param (
+	[string]$Commandline,
+	[ValidateNotNullOrEmpty()]
+	[string]$VolumeLabel = 'Provision',
+	[ValidateNotNullOrEmpty()]
+	[string]$RequiredRootFolder = 'ssis',
+	[string]$SsisCoreFolder = 'ssiscore',
+	[switch]$Strict,
+	[switch]$AutoCreate,
+	[switch]$EnableTranscript
+)
+
+# --- Dot-source Globals early ---
+if ($PSScriptRoot -and (Test-Path (Join-Path $PSScriptRoot 'Globals.ps1')))
+{
+	. (Join-Path $PSScriptRoot 'Globals.ps1')
+}
+
+# region: Helpers
+
+function Resolve-UsbRoot
+{
+	[CmdletBinding()]
+	param ([Parameter(Mandatory)]
+		[ValidateNotNullOrEmpty()]
+		[string]$Label)
+	
+	try
+	{
+		$vol = Get-Volume -ErrorAction Stop | Where-Object { $_.FileSystemLabel -eq $Label -and $_.DriveLetter }
+		if ($vol)
+		{
+			$root = '{0}:\' -f $vol.DriveLetter
+			Write-Verbose "Found volume '$Label' at $root"
+			return $root
+		}
+	}
+	catch
+	{
+		Write-Verbose "Get-Volume not available or failed: $($_.Exception.Message)"
+	}
+	
+	$fsDrives = Get-PSDrive -PSProvider FileSystem
+	foreach ($d in $fsDrives)
+	{
+		if ($null -ne $d.Description -and $d.Description -match [Regex]::Escape($Label))
+		{
+			Write-Verbose "Matched PSDrive by Description: $($d.Name) ($($d.Root))"
+			return $d.Root
+		}
+	}
+	Write-Verbose "No drive found with label '$Label'."
+	return $null
+}
+
+function Ensure-TrailingBackslash
+{
+	param ([Parameter(Mandatory)]
+		[string]$Path)
+	if ($Path[-1] -ne '\') { return $Path + '\' }
+	else { return $Path }
+}
+
+function Test-RequiredFolder
+{
+	[CmdletBinding()]
+	param ([Parameter(Mandatory)]
+		[string]$Root,
+		[Parameter(Mandatory)]
+		[string]$SubFolder)
+	
+	$full = Join-Path -Path $Root -ChildPath $SubFolder
+	if (Test-Path -Path $full -PathType Container)
+	{
+		$full = Ensure-TrailingBackslash $full
+		Write-Verbose "Verified required folder: $full"
+		return $full
+	}
+	else
+	{
+		throw "Required folder '$SubFolder' not found under '$Root'. Expected path: $full"
+	}
+}
+
+function Initialize-DefaultPaths
+{
+	[CmdletBinding()]
+	param ([Parameter(Mandatory)]
+		[string]$SsisRoot,
+		[string]$CoreRoot)
+	
+	$SsisRoot = Ensure-TrailingBackslash $SsisRoot
+	function _withSlash([string]$p) { if ($p[-1] -ne '\') { return $p + '\' }
+		return $p }
+	
+	$map = [ordered]@{
+		SsisRoot		  = $SsisRoot
+		ImagePath		  = _withSlash (Join-Path $SsisRoot 'images')
+		TbiImagePath	  = _withSlash (Join-Path $SsisRoot 'tbi_images')
+		DriverPacksPath   = _withSlash (Join-Path $SsisRoot 'driverpacks')
+		ScriptsPath	      = _withSlash (Join-Path $SsisRoot 'scripts')
+		TemplatesPath	  = _withSlash (Join-Path $SsisRoot 'templates')
+		UnattendPath	  = _withSlash (Join-Path $SsisRoot 'unattend')
+		ModulesPath	      = _withSlash (Join-Path $SsisRoot 'modules')
+		GraphicsPath	  = _withSlash (Join-Path $SsisRoot 'graphics')
+		CompatDriversPath = Join-Path $SsisRoot 'compat_drivers'
+		AppsPath		  = _withSlash (Join-Path $SsisRoot 'apps')
+		CoreAppsPath	  = $null
+		AdminAccount	  = 'rmadmin'
+		WindowsDir	      = $env:WINDIR
+	}
+	
+	if ($CoreRoot)
+	{
+		$coreBase = Join-Path (Split-Path -Path $SsisRoot -Parent) $CoreRoot
+		if (Test-Path -Path $coreBase -PathType Container)
+		{
+			$map.CoreAppsPath = _withSlash (Join-Path $coreBase 'apps')
+			Write-Verbose "CoreAppsPath set: $($map.CoreAppsPath)"
+		}
+	}
+	return $map
+}
+
+function Start-TranscriptIfEnabled
+{
+	[CmdletBinding()]
+	param ([Parameter(Mandatory)]
+		[string]$SsisRoot)
+	
+	if (-not $EnableTranscript) { return }
+	$logs = Join-Path $SsisRoot 'logs'
+	if (-not (Test-Path $logs))
+	{
+		try { New-Item -ItemType Directory -Path $logs -Force | Out-Null }
+		catch { Write-Warning "Failed to create logs folder: $logs. $_" }
+	}
+	$stamp = (Get-Date).ToString('yyyyMMdd_HHmmss')
+	$logPath = Join-Path $logs "Start-$stamp.log"
+	try
+	{
+		Start-Transcript -Path $logPath -Force | Out-Null
+		Write-Information "Transcript started: $logPath" -InformationAction Continue
+		$script:LogFile = $logPath # Optional: piggy-back Globals' Write-Log
+	}
+	catch
+	{
+		Write-Warning "Unable to start transcript: $($_.Exception.Message)"
+	}
+}
+
+function Ensure-Subfolders
+{
+	[CmdletBinding()]
+	param ([Parameter(Mandatory)]
+		[hashtable]$Paths)
+	
+	$checkKeys = @(
+		'ImagePath', 'TbiImagePath', 'DriverPacksPath', 'ScriptsPath',
+		'TemplatesPath', 'UnattendPath', 'ModulesPath', 'GraphicsPath', 'AppsPath'
+	)
+	
+	foreach ($key in $checkKeys)
+	{
+		$p = $Paths[$key]
+		if (-not $p) { continue }
+		
+		if (-not (Test-Path -Path $p -PathType Container))
+		{
+			if ($AutoCreate)
+			{
+				try { New-Item -ItemType Directory -Path $p -Force | Out-Null; Write-Information "Created: $key => $p" -InformationAction Continue }
+				catch
+				{
+					$msg = "Failed to create required path: $key => $p. $($_.Exception.Message)"
+					if ($Strict) { throw $msg }
+					else { Write-Warning $msg }
+				}
+			}
+			else
+			{
+				$msg = "Missing expected path: $key => $p"
+				if ($Strict) { throw $msg }
+				else { Write-Warning $msg }
+			}
+		}
+		else
+		{
+			Write-Verbose "$key OK: $p"
+		}
+	}
+}
+
+function Main
+{
+	[CmdletBinding()]
+	param ([string]$Commandline)
+	
+	Write-Verbose "Main() called with: $Commandline"
+	
+	if (Get-Command Show-MainForm_psf -ErrorAction SilentlyContinue)
+	{
+		$result = Show-MainForm_psf
+		Write-Verbose "Show-MainForm_psf returned: $result"
+	}
+	else
+	{
+		Write-Verbose "Show-MainForm_psf not found-GUI not started."
+	}
+	
+	$script:ExitCode = 0
+}
+
+# endregion Helpers
+
+# region: Orchestration
+
+try
+{
+	Write-Information "Searching for drive labeled '$VolumeLabel'..." -InformationAction Continue
+	$driveRoot = Resolve-UsbRoot -Label $VolumeLabel
+	
+	if (-not $driveRoot)
+	{
+		$msg = "Drive labeled '$VolumeLabel' not found. Insert/mount the media and retry."
+		if ($Strict) { throw $msg }
+		else { Write-Warning $msg; return }
+	}
+	
+	Write-Information "Validating required folder '$RequiredRootFolder' under $driveRoot..." -InformationAction Continue
+	$ssisRoot = Test-RequiredFolder -Root $driveRoot -SubFolder $RequiredRootFolder
+	
+	# Start transcript first so following steps are captured
+	Start-TranscriptIfEnabled -SsisRoot $ssisRoot
+	
+	# Build defaults, possibly include ssiscore
+	$Defaults = Initialize-DefaultPaths -SsisRoot $ssisRoot -CoreRoot $SsisCoreFolder
+	
+	# Expose your original flat variables for form code compatibility
+	$script:ssismain = $Defaults.SsisRoot
+	$script:default_imagepath = $Defaults.ImagePath
+	$script:default_tbi_imagepath = $Defaults.TbiImagePath
+	$script:default_driverpath = $Defaults.DriverPacksPath
+	$script:default_scriptpath = $Defaults.ScriptsPath
+	$script:default_templatepath = $Defaults.TemplatesPath
+	$script:default_unattendpath = $Defaults.UnattendPath
+	$script:default_modulespath = $Defaults.ModulesPath
+	$script:default_graphicspath = $Defaults.GraphicsPath
+	$script:default_compatdriverspath = $Defaults.CompatDriversPath
+	$script:default_appspath = $Defaults.AppsPath
+	$script:default_core_appspath = $Defaults.CoreAppsPath
+	$script:default_adminaccount = $Defaults.AdminAccount
+	$script:runningwin = $Defaults.WindowsDir
+	
+	# Optional: store media root for global access/logging
+	$script:TargetDrive = $driveRoot
+	
+	# Validate or create important subfolders
+	Ensure-Subfolders -Paths $Defaults
+	
+	# Launch app main
+	Main -Commandline $Commandline
+}
+catch
+{
+	Write-Error $_.Exception.Message
+	$script:ExitCode = 1
+	if ($PSBoundParameters.Verbose) { Write-Error $_.Exception.ToString() }
+}
+finally
+{
+	if ($EnableTranscript)
+	{
+		try { Stop-Transcript | Out-Null }
+		catch { }
+	}
+	# For Packager Forms Engine, $script:ExitCode is honored.
+	# If distributing as console, you may explicitly: exit $script:ExitCode
+}
+
+# endregion Orchestration]]></Code>
+  <TV>0</TV>
+</File>
