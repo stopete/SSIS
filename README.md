@@ -2,6 +2,9 @@
 
 🚀 SSIS Simple Seat Imaging System is a PowerShell-based Windows deployment and imaging platform designed for rapid workstation provisioning, disk imaging, and recovery operations.
 
+![IMG_9425](https://github.com/user-attachments/assets/0f48dc56-a688-4b27-b21f-8524bb5ef0ff)
+
+
 It is commonly used in WinPE environments to automate system deployment.
 
 The tool integrates:
